@@ -6,14 +6,17 @@ from oxygendemo.items import Product
 from pyquery import PyQuery as pq
 from scrapy.http import Request, FormRequest
 from scrapy.linkextractors import LinkExtractor
+from scrapy.signals import spider_idle
 from scrapy.spiders import CrawlSpider, Rule
+from scrapy.xlib.pydispatch import dispatcher
 from urlparse import urlsplit
 
 
 class OxygenSpider(CrawlSpider):
     name = 'oxygenboutique.com'
     allowed_domains = ['oxygenboutique.com']
-    base_url = 'https://oxygenboutique.com'
+    base_url = 'https://www.oxygenboutique.com'
+    currency_change_url = 'https://www.oxygenboutique.com/frontendhandler.ashx'
     start_urls = [base_url]
 
     # Oxygen Boutique's search page returns all items if you pass an empty query
@@ -38,18 +41,80 @@ class OxygenSpider(CrawlSpider):
         Rule(LinkExtractor(restrict_css='.homeProducts > a'), callback='parse_item'),
     )
 
-    def start_requests(self):
-        return [FormRequest(
-            'https://oxygenboutique.com/frontendhandler.ashx',
-            formdata={
-                'Action': 'UpdateCurrency',
-                'NewCurrency': '519EFDE3-30C5-49EF-8F8D-AD1ACF82DB0A',
-                'NewCountry': 'United States'
-            },
-            callback=self._start_crawl
-        )]
+    def __init__(self, *args, **kwargs):
+        self.prices = {'eur': {}, 'gbp': {}}
+        self.cookie_jars_set = False
+        super(OxygenSpider, self).__init__(*args, **kwargs)
+        dispatcher.connect(self.do_when_idle, spider_idle)
 
-    def _start_crawl(self, response):
+    def start_requests(self):
+        ''' acquire cookies for each currency we want'''
+        return [
+            FormRequest(
+                self.currency_change_url,
+                formdata={
+                    'Action': 'UpdateCurrency',
+                    'NewCurrency': '72105097-911D-4366-A591-DA74A2DAA544',
+                    'NewCountry': 'Republic of Ireland'
+                },
+                meta={
+                    'cookiejar': 'eur'
+                },
+                dont_filter=True,
+                callback=self.get_prices
+            ),
+            FormRequest(
+                self.currency_change_url,
+                formdata={
+                    'Action': 'UpdateCurrency',
+                    'NewCurrency': 'b2dd6e5d-5336-4195-b966-2c81d2b34899',
+                    'NewCountry': 'United Kingdom'
+                },
+                meta={
+                    'cookiejar': 'gbp'
+                },
+                dont_filter=True,
+                callback=self.get_prices
+            ),
+        ]
+
+    def get_prices(self, response):
+        return Request(
+            '{}/search-results?ViewAll=1'.format(self.base_url),
+            dont_filter=True,
+            meta=response.meta,
+            callback=self.populate_price_table
+        )
+
+    def populate_price_table(self, response):
+        body = pq(response.body)
+        specialchar = {'gbp': u'\u00a3', 'eur': u'\u20ac'}[response.meta['cookiejar']]
+        self.prices[response.meta['cookiejar']] = {
+            item('a').attr('href').strip('/'): item('.price').text().replace(specialchar, '').split()[0]
+            for item in body('.homeProducts').items()
+        }
+
+    def do_when_idle(self, spider):
+        if spider != self:
+            return
+
+        if not self.cookie_jars_set:
+            self.cookie_jars_set = True
+            self.crawler.engine.crawl(
+                FormRequest(
+                    self.currency_change_url,
+                    formdata={
+                        'Action': 'UpdateCurrency',
+                        'NewCurrency': '519EFDE3-30C5-49EF-8F8D-AD1ACF82DB0A',
+                        'NewCountry': 'United States'
+                    },
+                    dont_filter=True,
+                    callback=self.start_crawl
+                ),
+                spider
+            )
+
+    def start_crawl(self, response):
         for url in self.start_urls:
             yield Request(url)
 
@@ -57,7 +122,7 @@ class OxygenSpider(CrawlSpider):
         self.body = pq(response.body)
         item = Product()
 
-        item['gender'] = 'F'
+        item['gender'] = 'F'  # Female-only store, no way to tell otherwise
         item['designer'] = self.body('.details h2 a').text()
         item['code'] = urlsplit(response.url)[2].strip("/")
         item['name'] = self.body('.details h2').text()
@@ -69,6 +134,9 @@ class OxygenSpider(CrawlSpider):
         item['usd_price'], item['sale_discount'] = self.get_usd_price()
         item['stock_status'] = self.get_stock_status()
         item['link'] = response.url
+
+        item['eur_price'] = self.prices['eur'].pop(item['code'], None)
+        item['gbp_price'] = self.prices['gbp'].pop(item['code'], None)
         yield item
 
     def get_type(self, name):
@@ -105,7 +173,9 @@ class OxygenSpider(CrawlSpider):
     def get_description(self):
         accordion = self.body('#accordion div div')
         text_desc = accordion.eq(0).text()
-        size_fit_desc = '. '.join([line.text() for line in accordion.eq(1)('div div').items() if line.text() != ''])
+        size_fit_desc = '. '.join(
+            [line.text() for line in accordion.eq(1)('div div').items() if line.text() != '']
+        )
         return ' '.join([text_desc, size_fit_desc])
 
     def get_color(self, description):
@@ -124,9 +194,7 @@ class OxygenSpider(CrawlSpider):
 
         rgx = r'\b({})\b'.format('|'.join(colors))
         match = re.search(rgx, description.lower())
-        if match:
-            return match.group(1)
-        return None
+        return match.group(1) if match else None
 
     def get_stock_status(self):
         return {i.text(): 1 if i.attr('style') == 'display:none;' else 3
