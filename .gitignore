@@ -1,0 +1,5 @@
+*.pyc
+*.out
+venv
+*.whl
+*.exe
