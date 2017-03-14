@@ -22,7 +22,7 @@ class OxygenSpider(CrawlSpider):
     # Oxygen Boutique's search page returns all items if you pass an empty query
     # So I could just start at that page and have near perfect efficiency
     # However, it doesn't seem like good practice
-    # And I wouldn't have to write any rules
+    # And I wouldn't have to write many rules
 
     # start_urls = ['https://www.oxygenboutique.com/search-results?q=&ViewAll=1&s=5']
 
@@ -95,6 +95,7 @@ class OxygenSpider(CrawlSpider):
         }
 
     def do_when_idle(self, spider):
+        ''' Make sure that converted currencies are filled out before starting crawl'''
         if spider != self:
             return
 
@@ -160,7 +161,6 @@ class OxygenSpider(CrawlSpider):
 
     def get_usd_price(self):
         price = self.body('.details .price').text()
-        # price = price.replace(u'\xa3', '').replace(',', '').strip().split()
         price = price.replace('$', '').replace(',', '').strip().split()
 
         discounted_price = float(price[-1].replace(',', '') or '0')
